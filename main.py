@@ -12,6 +12,8 @@ import niquests
 import requests
 
 REQUESTS_COUNT = 200
+# Concurrent in-flight requests per batch (same total count as sequential, see _parallel_batch_sizes).
+PARALLEL_CONCURRENCY = 40
 # Cloudflare serves HTTP/1.1, HTTP/2 and HTTP/3
 URL = "https://www.cloudflare.com/cdn-cgi/trace"
 
@@ -187,6 +189,135 @@ def _pct_gain_vs_slowest(seconds: float, slowest: float) -> float:
     return 100.0 * (slowest - seconds) / slowest
 
 
+def _parallel_batch_sizes() -> list[int]:
+    """Batch sizes that sum to REQUESTS_COUNT (each batch runs concurrently)."""
+    total = REQUESTS_COUNT
+    cap = PARALLEL_CONCURRENCY
+    if cap < 1:
+        raise ValueError("PARALLEL_CONCURRENCY must be >= 1")
+    batches: list[int] = []
+    while total > 0:
+        chunk = min(cap, total)
+        batches.append(chunk)
+        total -= chunk
+    return batches
+
+
+def _print_result_table(results: list[RunResult], intro: str) -> None:
+    slowest = max(t for _, t in results)
+    results = sorted(results, key=lambda item: item[1])
+    print(intro)
+    label_w = max(len(name) for name, _ in results)
+    print(f"{'Client':<{label_w}}  {'Time (s)':>10}  {'Gain':>8}")
+    print("-" * (label_w + 10 + 8 + 4))
+    for name, sec in results:
+        gain = _pct_gain_vs_slowest(sec, slowest)
+        print(f"{name:<{label_w}}  {sec:>10.3f}  {gain:>7.1f}%")
+    print()
+
+
+async def _parallel_httpx(http2: bool, label: str) -> RunResult:
+    _testing(label)
+    batches = _parallel_batch_sizes()
+    start = time.perf_counter()
+    async with httpx.AsyncClient(http1=True, http2=http2) as client:
+
+        async def one_get() -> None:
+            response = await client.get(URL)
+            await response.aread()
+
+        for size in batches:
+            await asyncio.gather(*(one_get() for _ in range(size)))
+    return (label, time.perf_counter() - start)
+
+
+async def _parallel_niquests_http1() -> RunResult:
+    label = "niquests (AsyncSession / parallel / HTTP/1.1)"
+    _testing(label)
+    batches = _parallel_batch_sizes()
+    start = time.perf_counter()
+    async with niquests.AsyncSession(
+        disable_http2=True, disable_http3=True, multiplexed=False
+    ) as session:
+
+        async def one() -> str:
+            response = await session.get(URL)
+            return response.text
+
+        for size in batches:
+            await asyncio.gather(*(one() for _ in range(size)))
+    return (label, time.perf_counter() - start)
+
+
+async def _parallel_niquests_http2() -> RunResult:
+    label = "niquests (AsyncSession / parallel / HTTP/2 only)"
+    _testing(label)
+    batches = _parallel_batch_sizes()
+    start = time.perf_counter()
+    async with niquests.AsyncSession(
+        disable_http1=True, disable_http3=True, multiplexed=True
+    ) as session:
+        for size in batches:
+            pending: list[object] = []
+            for _ in range(size):
+                pending.append(await session.get(URL))
+            await session.gather(*pending)
+    return (label, time.perf_counter() - start)
+
+
+async def _parallel_niquests_http3() -> RunResult | None:
+    label = "niquests (AsyncSession / parallel / HTTP/3 only)"
+    _testing(label)
+    try:
+        host = _url_hostname()
+        batches = _parallel_batch_sizes()
+        start = time.perf_counter()
+        async with niquests.AsyncSession(
+            disable_http1=True, disable_http2=True, multiplexed=True
+        ) as session:
+            session.quic_cache_layer.add_domain(host)
+            for size in batches:
+                pending: list[object] = []
+                for _ in range(size):
+                    pending.append(await session.get(URL))
+                await session.gather(*pending)
+        return (label, time.perf_counter() - start)
+    except Exception as exc:
+        print(f"Skipped: {label} ({exc})", file=sys.stderr)
+        return None
+
+
+async def _parallel_aiohttp() -> RunResult:
+    label = "aiohttp (ClientSession / parallel / HTTP/1.1)"
+    _testing(label)
+    batches = _parallel_batch_sizes()
+    start = time.perf_counter()
+    async with aiohttp.ClientSession() as session:
+
+        async def one() -> str:
+            async with session.get(URL) as response:
+                return await response.text()
+
+        for size in batches:
+            await asyncio.gather(*(one() for _ in range(size)))
+    return (label, time.perf_counter() - start)
+
+
+async def _async_parallel_benchmarks() -> list[RunResult]:
+    out: list[RunResult] = []
+    out.append(
+        await _parallel_httpx(False, "httpx (AsyncClient / parallel / HTTP/1.1)")
+    )
+    out.append(await _parallel_httpx(True, "httpx (AsyncClient / parallel / HTTP/2)"))
+    out.append(await _parallel_niquests_http1())
+    out.append(await _parallel_niquests_http2())
+    h3 = await _parallel_niquests_http3()
+    if h3 is not None:
+        out.append(h3)
+    out.append(await _parallel_aiohttp())
+    return out
+
+
 def main() -> None:
     results: list[RunResult] = [
         _bench_requests_no_session(),
@@ -209,16 +340,20 @@ def main() -> None:
 
     results.extend(asyncio.run(_aiohttp_benchmarks()))
 
-    slowest = max(t for _, t in results)
-    results.sort(key=lambda item: item[1])
+    parallel = asyncio.run(_async_parallel_benchmarks())
 
-    print(f"\n{REQUESTS_COUNT} GET requests to {URL}\n")
-    label_w = max(len(name) for name, _ in results)
-    print(f"{'Client':<{label_w}}  {'Time (s)':>10}  {'Gain':>8}")
-    print("-" * (label_w + 10 + 8 + 4))
-    for name, sec in results:
-        gain = _pct_gain_vs_slowest(sec, slowest)
-        print(f"{name:<{label_w}}  {sec:>10.3f}  {gain:>7.1f}%")
+    seq_intro = (
+        f"\n{REQUESTS_COUNT} sequential GET requests to {URL}\n"
+        f"(Gain = percent time saved vs slowest in this block)\n"
+    )
+    _print_result_table(results, seq_intro)
+
+    par_intro = (
+        f"{REQUESTS_COUNT} GET requests to {URL} "
+        f"({PARALLEL_CONCURRENCY} concurrent per batch; async)\n"
+        f"(Gain = percent time saved vs slowest in this block)\n"
+    )
+    _print_result_table(parallel, par_intro)
 
 
 if __name__ == "__main__":
